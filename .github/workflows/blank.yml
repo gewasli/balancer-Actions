@@ -1,0 +1,205 @@
+name: IP Load Balancer Check
+
+on:
+  push:
+    branches: [ BiLi_PC_Gamer ]
+    paths:
+      - 'app/src/main/java/com/hippo/ehviewer/client/EhHosts.kt' # 仅当EhHosts.kt修改时触发
+      - '.github/workflows/ip-load-balancer.yml'
+  pull_request:
+    branches: [ BiLi_PC_Gamer ]
+    paths:
+      - 'app/src/main/java/com/hippo/ehviewer/client/EhHosts.kt'
+      - '.github/workflows/ip-load-balancer.yml'
+  workflow_dispatch: # 手动触发
+
+jobs:
+  ip-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: 21
+
+      - name: Create IP Check Script
+        run: |
+          # 创建Kotlin脚本，解析EhHosts.kt并检测IP可用性
+          cat > IpChecker.kt << 'EOF'
+          import java.net.InetSocketAddress
+          import java.net.Socket
+          import java.nio.file.Files
+          import java.nio.file.Paths
+          import java.util.*
+          import java.util.regex.Pattern
+
+          // 解析EhHosts.kt中的内置IP列表
+          fun parseEhHosts(): Map<String, List<String>> {
+              val hostsPath = Paths.get("app/src/main/java/com/hippo/ehviewer/client/EhHosts.kt")
+              val content = Files.readString(hostsPath)
+              val ipMap = mutableMapOf<String, MutableList<String>>()
+
+              // 匹配put(map, "host", "ip1", "ip2", ...)格式
+              val pattern = Pattern.compile("put\\(map, \"([^\"]+)\",([^)]+)\\)")
+              val matcher = pattern.matcher(content)
+
+              while (matcher.find()) {
+                  val host = matcher.group(1)
+                  val ipsPart = matcher.group(2)
+                  // 提取IP（匹配IPv4/IPv6）
+                  val ipPattern = Pattern.compile("\"([0-9a-fA-F:.]+)\"")
+                  val ipMatcher = ipPattern.matcher(ipsPart)
+                  val ips = mutableListOf<String>()
+                  while (ipMatcher.find()) {
+                      val ip = ipMatcher.group(1)
+                      if (ip.isNotBlank()) {
+                          ips.add(ip)
+                      }
+                  }
+                  if (ips.isNotEmpty()) {
+                      ipMap[host] = ips
+                  }
+              }
+              return ipMap
+          }
+
+          // 检测单个IP的连通性和延迟
+          fun testIp(host: String, ip: String): Pair<Boolean, Long> {
+              return try {
+                  val startTime = System.currentTimeMillis()
+                  Socket().use { socket ->
+                      // 尝试连接443端口（HTTPS），超时3秒
+                      socket.connect(InetSocketAddress(ip, 443), 3000)
+                      val latency = System.currentTimeMillis() - startTime
+                      Pair(true, latency)
+                  }
+              } catch (e: Exception) {
+                  Pair(false, -1)
+              }
+          }
+
+          // 生成负载均衡最优IP列表
+          fun generateBestIpList(ipMap: Map<String, List<String>>): Map<String, List<Pair<String, Long>>> {
+              val bestIpMap = mutableMapOf<String, List<Pair<String, Long>>>()
+              ipMap.forEach { (host, ips) ->
+                  val ipResults = mutableListOf<Pair<String, Long>>()
+                  ips.distinct().forEach { ip -> // 去重
+                      val (isSuccess, latency) = testIp(host, ip)
+                      if (isSuccess) {
+                          ipResults.add(Pair(ip, latency))
+                      }
+                  }
+                  // 按延迟升序排序（最优在前）
+                  val sortedIps = ipResults.sortedBy { it.second }
+                  bestIpMap[host] = sortedIps
+              }
+              return bestIpMap
+          }
+
+          // 生成报告
+          fun generateReport(bestIpMap: Map<String, List<Pair<String, Long>>>): String {
+              val report = StringBuilder()
+              report.append("# EhHosts IP 负载均衡检测报告\n")
+              report.append("生成时间: ${Date()}\n\n")
+              report.append("| 域名 | 最优IP | 延迟(ms) | 所有可用IP（按延迟排序） |\n")
+              report.append("|------|--------|----------|--------------------------|\n")
+              
+              bestIpMap.forEach { (host, ips) ->
+                  val bestIp = ips.firstOrNull()
+                  val bestIpStr = bestIp?.first ?: "无可用IP"
+                  val bestLatency = bestIp?.second ?: -1
+                  val allIpsStr = ips.joinToString(", ") { "${it.first}(${it.second}ms)" }
+                  
+                  report.append("| $host | $bestIpStr | $bestLatency | $allIpsStr |\n")
+              }
+              return report.toString()
+          }
+
+          // 生成App可用的最优IP配置文件
+          fun generateIpConfig(bestIpMap: Map<String, List<Pair<String, Long>>>): String {
+              val config = StringBuilder()
+              config.append("package com.hippo.ehviewer.client\n\n")
+              config.append("object BestEhHosts {\n")
+              config.append("    // 自动生成的最优IP列表（按延迟升序）\n")
+              config.append("    val BEST_IP_MAP: Map<String, List<String>> = mapOf(\n")
+              
+              bestIpMap.forEachIndexed { index, (host, ips) ->
+                  val ipList = ips.map { "\"${it.first}\"" }.joinToString(", ")
+                  val comma = if (index == bestIpMap.size - 1) "" else ","
+                  config.append("        \"$host\" to listOf($ipList)$comma\n")
+              }
+              
+              config.append("    )\n")
+              config.append("}\n")
+              return config.toString()
+          }
+
+          fun main() {
+              // 1. 解析EhHosts.kt
+              val ipMap = parseEhHosts()
+              println("✅ 解析到内置IP列表: ${ipMap.keys.joinToString(", ")}")
+              
+              // 2. 检测IP可用性并生成最优列表
+              val bestIpMap = generateBestIpList(ipMap)
+              println("✅ IP检测完成，开始生成报告...")
+              
+              // 3. 生成报告
+              val report = generateReport(bestIpMap)
+              Files.writeString(Paths.get("ip-check-report.md"), report)
+              println("✅ 检测报告已生成: ip-check-report.md")
+              
+              // 4. 生成最优IP配置文件
+              val ipConfig = generateIpConfig(bestIpMap)
+              Files.writeString(
+                  Paths.get("app/src/main/java/com/hippo/ehviewer/client/BestEhHosts.kt"),
+                  ipConfig
+              )
+              println("✅ 最优IP配置文件已生成: BestEhHosts.kt")
+          }
+
+          main()
+          EOF
+
+      - name: Run IP Check Script
+        run: |
+          # 编译并运行Kotlin脚本
+          kotlinc IpChecker.kt -include-runtime -d IpChecker.jar
+          java -jar IpChecker.jar
+
+      - name: Upload IP Check Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ip-load-balancer-report
+          path: |
+            ip-check-report.md
+            app/src/main/java/com/hippo/ehviewer/client/BestEhHosts.kt
+
+      - name: Integrate Best IP into Build
+        # 将最优IP注入到原EhHosts.kt中（可选，替换随机逻辑为最优IP优先）
+        run: |
+          # 修改EhHosts.kt的lookup方法，优先使用最优IP
+          sed -i '/override fun lookup(hostname: String): MutableList<InetAddress?> {/a \
+              // 优先使用自动检测的最优IP\n\
+              val bestIps = BestEhHosts.BEST_IP_MAP[hostname]\n\
+              if (bestIps != null && bestIps.isNotEmpty()) {\n\
+                  val addresses = bestIps.map { Hosts.toInetAddress(hostname, it) }.filterNotNull()\n\
+                  if (addresses.isNotEmpty()) {\n\
+                      return addresses.toMutableList()\n\
+                  }\n\
+              }' app/src/main/java/com/hippo/ehviewer/client/EhHosts.kt
+
+      - name: Build App with Best IP
+        # 构建App（复用原构建逻辑）
+        run: |
+          chmod +x ./gradlew
+          ./gradlew app:assembleDebug
+
+      - name: Upload Build with Best IP
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-with-ip-load-balancer
+          path: ./app/build/outputs/apk/
