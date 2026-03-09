@@ -7,14 +7,10 @@ from typing import Dict, List, Tuple
 from urllib.parse import urlparse
 
 # ===================== 配置项 =====================
-# 目标文件地址
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/xiaojieonly/Ehviewer_CN_SXJ/refs/heads/BiLi_PC_Gamer/app/src/main/java/com/hippo/ehviewer/client/EhHosts.kt"
-# 测速配置
 TEST_TIMEOUT = 3  # 超时时间（秒）
 TEST_COUNT = 2    # 每个IP测试次数
-# 输出文件
 OUTPUT_HOSTS = "./optimized_hosts.txt"
-# User-Agent（模拟浏览器访问）
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 # ===================== 数据结构 =====================
@@ -24,10 +20,10 @@ class IPResult:
     delay: float = float('inf')  # 延迟（毫秒）
     available: bool = False
 
-# ===================== 步骤1：解析EhHosts.kt，提取域名-IP映射 =====================
+# ===================== 步骤1：修复版解析逻辑 =====================
 def extract_hosts_mapping() -> Dict[str, List[str]]:
     """
-    从EhHosts.kt中提取builtInHosts的域名-IP映射
+    修复版：精准解析EhHosts.kt中跨多行、带缩进的put方法调用
     返回格式：{"e-hentai.org": ["104.20.18.168", ...], ...}
     """
     print(f"📥 拉取文件: {GITHUB_RAW_URL}")
@@ -37,35 +33,42 @@ def extract_hosts_mapping() -> Dict[str, List[str]]:
         response.raise_for_status()
         content = response.text
 
-        # 1. 提取builtInHosts中的put方法调用（核心正则）
-        # 匹配格式：put(map, "域名", "ip1", "ip2", ...)
-        put_pattern = re.compile(
-            r'put\(\s*map,\s*"([^"]+)"\s*,\s*(["\d\.\:,]+?)\s*\)',
-            re.DOTALL | re.MULTILINE
-        )
-        matches = put_pattern.findall(content)
-
+        # 第一步：移除所有注释（// 开头的内容）
+        content = re.sub(r'//.*?$', '', content, flags=re.MULTILINE)
+        # 第二步：将跨多行的put调用合并为单行（关键修复）
+        # 匹配put( 开头，直到 ); 结束的整块内容
+        put_blocks = re.findall(r'put\(\s*map,\s*[^;]+?\);', content, re.DOTALL)
+        
         hosts_mapping = {}
-        for match in matches:
-            domain = match[0].strip()
-            ip_parts = match[1].split(',')
-            
-            # 提取合法IPv4（过滤注释、IPv6、空值）
-            ips = []
-            for part in ip_parts:
-                # 清理字符串（移除引号、空格、注释）
-                clean_part = part.strip().strip('"').split("//")[0].strip()
-                # 校验IPv4格式
-                if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', clean_part):
-                    ips.append(clean_part)
-            
-            # 去重并保存
-            if ips:
-                hosts_mapping[domain] = list(set(ips))
-                print(f"✅ 提取域名 {domain} - IP列表: {ips}")
+        for block in put_blocks:
+            # 清理块内的换行和多余空格
+            clean_block = re.sub(r'\s+', ' ', block).strip()
+            # 提取域名和IP列表
+            # 匹配格式：put( map, "域名", "ip1", "ip2", ... );
+            pattern = re.compile(r'put\(\s*map,\s*"([^"]+)"\s*,\s*(.*?)\s*\);')
+            match = pattern.search(clean_block)
+            if match:
+                domain = match.group(1).strip()
+                ip_str = match.group(2).strip()
+                # 拆分IP列表并清理
+                ip_list = [ip.strip().strip('"') for ip in ip_str.split(',') if ip.strip()]
+                # 过滤出合法的IPv4
+                valid_ips = []
+                for ip in ip_list:
+                    if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+                        valid_ips.append(ip)
+                # 去重并保存
+                if valid_ips:
+                    hosts_mapping[domain] = list(set(valid_ips))
+                    print(f"✅ 提取域名 {domain} - IP列表: {valid_ips}")
 
+        # 调试：打印原始匹配结果（便于排查）
+        print(f"\n🔍 调试信息 - 匹配到的put块数量: {len(put_blocks)}")
         if not hosts_mapping:
+            # 输出原始内容片段（前2000字符）便于排查
+            print(f"❌ 未提取到有效映射，原始内容片段:\n{content[:2000]}")
             raise ValueError("未提取到任何有效域名-IP映射")
+        
         print(f"\n📊 共提取 {len(hosts_mapping)} 个域名的IP映射")
         return hosts_mapping
 
@@ -73,14 +76,9 @@ def extract_hosts_mapping() -> Dict[str, List[str]]:
         print(f"❌ 解析失败: {str(e)}")
         raise
 
-# ===================== 步骤2：定向测速（针对每个域名的IP） =====================
+# ===================== 步骤2：定向测速 =====================
 def test_ip_for_domain(domain: str, ips: List[str]) -> Tuple[str, float]:
-    """
-    测试指定域名的所有IP访问速度，返回最优IP和延迟
-    :param domain: 目标域名（如e-hentai.org）
-    :param ips: 该域名对应的IP列表
-    :return: (最优IP, 平均延迟)
-    """
+    """测试指定域名的所有IP访问速度，返回最优IP和延迟"""
     print(f"\n🔍 测试域名 {domain} 的IP性能:")
     results = []
 
@@ -90,8 +88,9 @@ def test_ip_for_domain(domain: str, ips: List[str]) -> Tuple[str, float]:
         
         for _ in range(TEST_COUNT):
             try:
-                # 构造请求：直接访问IP + Host头（模拟域名解析）
-                url = f"https://{ip}/" if domain != "raw.githubusercontent.com" else f"http://{ip}/"
+                # 适配不同域名的协议（raw.githubusercontent.com用HTTP）
+                scheme = "http" if domain == "raw.githubusercontent.com" else "https"
+                url = f"{scheme}://{ip}/"
                 headers = {
                     "Host": domain,
                     "User-Agent": USER_AGENT,
@@ -100,7 +99,7 @@ def test_ip_for_domain(domain: str, ips: List[str]) -> Tuple[str, float]:
                 }
 
                 start = time.time()
-                # 只请求头，不下载内容（提升测速效率）
+                # 只请求头，不下载内容
                 response = requests.get(
                     url,
                     headers=headers,
@@ -108,17 +107,14 @@ def test_ip_for_domain(domain: str, ips: List[str]) -> Tuple[str, float]:
                     allow_redirects=False,
                     verify=False  # 忽略SSL证书错误
                 )
-                # 只要能建立连接并返回状态码，就算可用
                 if response.status_code >= 100 and response.status_code < 600:
-                    delay = (time.time() - start) * 1000  # 转换为毫秒
+                    delay = (time.time() - start) * 1000
                     delays.append(delay)
-                time.sleep(0.2)  # 避免请求过快被限流
+                time.sleep(0.2)
 
             except Exception as e:
-                # 失败则跳过
                 continue
         
-        # 计算平均延迟
         if delays:
             ip_result.delay = sum(delays) / len(delays)
             ip_result.available = True
@@ -127,22 +123,21 @@ def test_ip_for_domain(domain: str, ips: List[str]) -> Tuple[str, float]:
         else:
             print(f"   ❌ {ip} - 不可达")
 
-    # 选择最优IP（延迟最低）
+    # 选择最优IP
     if results:
         best_ip = min(results, key=lambda x: x.delay)
         return best_ip.ip, best_ip.delay
     else:
-        # 所有IP都不可达时，返回第一个IP（降级策略）
         print(f"   ⚠️ 所有IP均不可达，使用第一个IP: {ips[0]}")
         return ips[0], 999.99
 
-# ===================== 步骤3：生成优化后的hosts文件 =====================
+# ===================== 步骤3：生成hosts文件 =====================
 def generate_optimized_hosts(hosts_mapping: Dict[str, List[str]]):
     """生成每个域名对应最优IP的hosts文件"""
     print("\n📝 开始生成优化后的hosts文件...")
-    best_mapping = {}  # 存储每个域名的最优IP
+    best_mapping = {}
 
-    # 逐个域名测试并选择最优IP
+    # 逐个域名测试
     for domain, ips in hosts_mapping.items():
         best_ip, delay = test_ip_for_domain(domain, ips)
         best_mapping[domain] = (best_ip, delay)
@@ -157,12 +152,12 @@ def generate_optimized_hosts(hosts_mapping: Dict[str, List[str]]):
         ""
     ]
 
-    # 按域名排序，写入hosts
+    # 写入hosts
     for domain in sorted(best_mapping.keys()):
         best_ip, delay = best_mapping[domain]
         hosts_content.append(f"{best_ip:<15} {domain}  # 延迟: {delay:.2f}ms")
 
-    # 写入文件
+    # 保存文件
     with open(OUTPUT_HOSTS, 'w', encoding='utf-8') as f:
         f.write('\n'.join(hosts_content))
 
@@ -173,12 +168,17 @@ def generate_optimized_hosts(hosts_mapping: Dict[str, List[str]]):
 
 # ===================== 主流程 =====================
 if __name__ == "__main__":
-    # 禁用requests警告（忽略SSL证书错误）
+    # 禁用requests警告
     requests.packages.urllib3.disable_warnings()
     
     print("🚀 开始提取并优化EhViewer Hosts...")
-    # 1. 解析域名-IP映射
-    hosts_mapping = extract_hosts_mapping()
-    # 2. 生成优化后的hosts文件
-    generate_optimized_hosts(hosts_mapping)
-    print("\n🎉 操作完成！可直接使用生成的hosts文件")
+    try:
+        # 1. 解析域名-IP映射
+        hosts_mapping = extract_hosts_mapping()
+        # 2. 生成优化后的hosts文件
+        generate_optimized_hosts(hosts_mapping)
+        print("\n🎉 操作完成！可直接使用生成的hosts文件")
+    except Exception as e:
+        print(f"\n❌ 执行失败: {str(e)}")
+        # 非零退出码触发Actions失败
+        exit(1)
