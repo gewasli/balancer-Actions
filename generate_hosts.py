@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import List, Dict
 
 # 配置项
-GITHUB_RAW_URL = "https://raw.githubusercontent.com/xiaojieonly/Ehviewer_CN_SXJ/master/app/src/main/java/com/hippo/ehviewer/client/wifi/EhHosts.kt"
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/xiaojieonly/Ehviewer_CN_SXJ/refs/heads/BiLi_PC_Gamer/app/src/main/java/com/hippo/ehviewer/client/EhHosts.kt"
 TARGET_DOMAINS = ["e-hentai.org", "exhentai.org", "ehgt.org", "api.e-hentai.org"]
 OUTPUT_HOSTS_PATH = "./generated_hosts"  # 输出路径（Action工作目录）
 PING_TIMEOUT = 2
